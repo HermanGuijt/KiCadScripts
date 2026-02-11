@@ -96,32 +96,70 @@ def parse_kicad_schematic(sch_path: str) -> List[Dict]:
     # Find all symbol instances in the schematic (KiCAD 9 format)
     idx = 0
     while True:
-        # Look for "(symbol" at the start of a line or after whitespace
-        idx = content.find('\n\t(symbol', idx)
-        if idx == -1:
+        # Look for "(symbol" - can be indented with tabs or spaces
+        # First try to find with tab (most common), then with spaces
+        idx_tab = content.find('\n\t(symbol', idx)
+        idx_space = content.find('\n    (symbol', idx)  # 4 spaces  
+        idx_space2 = content.find('\n       (symbol', idx)  # 7 spaces (less common)
+        
+        # Use whichever comes first (if found)
+        candidates = [i for i in [idx_tab, idx_space, idx_space2] if i != -1]
+        if not candidates:
             break
         
+        idx = min(candidates)
         idx += 1  # Skip the newline
         
-        # Find the matching closing parenthesis
-        depth = 0
-        end = idx
-        start = idx
-        while end < len(content):
-            if content[end] == '(':
-                depth += 1
-            elif content[end] == ')':
-                depth -= 1
-                if depth == 0:
-                    end += 1
-                    break
-            end += 1
+        # Find the start of (symbol - skip whitespace
+        symbol_start_pos = idx
+        while symbol_start_pos < len(content) and content[symbol_start_pos] in ' \t':
+            symbol_start_pos += 1
         
-        symbol_block = content[start:end]
+        # Find the matching closing parenthesis (skip strings)
+        depth = 0
+        pos = symbol_start_pos
+        in_string = False
+        escape_next = False
+        
+        while pos < len(content):
+            char = content[pos]
+            
+            # Handle string escaping
+            if escape_next:
+                escape_next = False
+                pos += 1
+                continue
+            
+            if char == '\\' and in_string:
+                escape_next = True
+                pos += 1
+                continue
+            
+            # Toggle string mode
+            if char == '"':
+                in_string = not in_string
+                pos += 1
+                continue
+            
+            # Only count parentheses outside of strings
+            if not in_string:
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    depth -= 1
+                    if depth == 0:
+                        pos += 1
+                        break
+            
+            pos += 1
+        
+        symbol_block = content[symbol_start_pos:pos]
+        
+        # Move index forward for next search
+        idx = pos
         
         # Check if this is an actual component (has lib_id and in_bom yes)
         if '(in_bom yes)' not in symbol_block:
-            idx = end
             continue
         
         # Extract component properties
@@ -175,8 +213,6 @@ def parse_kicad_schematic(sch_path: str) -> List[Dict]:
                 'price_qty_10': price_10,
                 'price_qty_100': price_100,
             })
-        
-        idx = end
     
     return components
 
@@ -186,6 +222,7 @@ def deduplicate_multi_unit_components(components: List[Dict]) -> List[Dict]:
     
     Multi-unit components (like multi-gate ICs) appear multiple times in the schematic
     with the same reference but different units. We only want to count them once.
+    Keep the unit that has pricing information if available.
     """
     unique_components = {}
     duplicates_found = []
@@ -195,8 +232,21 @@ def deduplicate_multi_unit_components(components: List[Dict]) -> List[Dict]:
         if ref in unique_components:
             # Already seen this reference - this is a duplicate unit
             existing = unique_components[ref]
+            
+            # Update sheet names
             if comp['sheet_name'] not in existing['sheet_name']:
                 existing['sheet_name'] = f"{existing['sheet_name']}, {comp['sheet_name']}"
+            
+            # If current component has pricing info and existing doesn't, use current
+            if comp['price_qty_1'] > 0 and existing['price_qty_1'] == 0:
+                existing['price_qty_1'] = comp['price_qty_1']
+                existing['price_qty_10'] = comp['price_qty_10']
+                existing['price_qty_100'] = comp['price_qty_100']
+                existing['mfr'] = comp['mfr'] or existing['mfr']
+                existing['mfr_part_number'] = comp['mfr_part_number'] or existing['mfr_part_number']
+                existing['supplier_part_number'] = comp['supplier_part_number'] or existing['supplier_part_number']
+                existing['description'] = comp['description'] or existing['description']
+            
             # Track this duplicate
             duplicates_found.append({
                 'reference': ref,
